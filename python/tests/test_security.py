@@ -15,6 +15,9 @@ from yea import (
 )
 from yea._json import b64url_encode
 from yea.approval import reserve_all
+from yea.errors import YeaError
+from yea.keys import sign_proof
+from yea.service.verified_request import VerifiedIntent, verify_request
 from yea.store import LedgerKey, MemoryStore
 from yea.uses import quantity
 
@@ -580,3 +583,46 @@ def test_approval_never_covers_content_lens_cuts():
 
     shown = safe_effect_line(proposal(28)["effects"][0])
     assert "attacker@evil.test" in shown and "…" not in shown
+
+
+def test_the_verified_request_names_the_holder_only_from_a_proof_it_verified():
+    """Mirrors 'the verified request (#278)' in TS: the holder, and so an auto INTENT's replay key,
+    come only from a proof the verified request checked (#157)."""
+    svc = pay_service()
+    now = int(time.time())
+    frame = {"yea": 1, "id": "f1", "verb": "INTENT", "capability": "pay.send", "params": {"to": "a", "amt": 1}, "auto": True}
+    grants = [issue_grant(PRINCIPAL, AGENT.public, []).encode()]
+    proof = sign_proof(AGENT, "pay", "INTENT", "auto:pay.send:f1", now)
+    forged = {"key": AGENT.public, "ts": now, "sig": "A" * 86}
+
+    ok = verify_request(svc.state, {**frame, "grants": grants, "proof": proof}, 2000)
+    assert isinstance(ok, VerifiedIntent) and ok.auto is not None
+    assert (ok.holder, ok.principal, ok.auto.replay) == (AGENT.public, PRINCIPAL.public, (f"{AGENT.public}:f1", now))
+    for grants_, code in ((grants, "unauthorized"), ({}, "bad_frame"), ([None], "bad_frame")):
+        with pytest.raises(YeaError) as e:
+            verify_request(svc.state, {**frame, "grants": grants_, "proof": forged}, 2000)
+        assert e.value.code == code
+    # With no grants the forged proof is never read: anonymous, with no replay key.
+    anon = verify_request(svc.state, {**frame, "grants": [], "proof": forged}, 2000)
+    assert isinstance(anon, VerifiedIntent) and anon.auto is not None
+    assert (anon.holder, anon.principal, anon.auto.replay) == (None, None, None)
+
+
+def test_m4b_a_non_requester_whose_grant_would_need_consent_gets_forbidden():
+    """[M4b] Who may commit is checked before the limits (#278), so another agent never gets a consent
+    request for a proposal it could not commit even with the consent."""
+    other = key_from_seed(bytes([3]) * 32)
+    each = {"each": {"of": "spend", "max": 10, "scale": 2, "unit": "USD"}}
+
+    async def go():
+        svc = pay_service()
+        mine = await proposal(client(svc), "shop", 50)
+        # The same limit asks the requester for consent: the grant would need it.
+        own = await client(svc, each).commit(mine)
+        assert (own.kind, own.code) == ("ERROR", "consent_required")
+        thief = Client(local(svc), key=other, grants=[issue_grant(PRINCIPAL, other.public, [each]).encode()])
+        r = await thief.commit(mine)
+        assert (r.kind, r.code, r.message, r.get("consent")) == (
+            "ERROR", "forbidden", "only the agent that requested this proposal can commit it", None)
+
+    run(go())

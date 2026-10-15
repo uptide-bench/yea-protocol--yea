@@ -38,6 +38,10 @@ import {
   serveFetch,
   serveHttp,
 } from '../src/node.js';
+import {
+  type Verifier,
+  verifyRequest,
+} from '../src/service/verified-request.js';
 import { printable } from '../src/text.js';
 import { createToolHost } from '../src/tools.js';
 
@@ -422,6 +426,33 @@ describe('security regressions', () => {
     const thief = await client(svc, otherAgent, principal); // same principal, different agent key
 
     expect((await thief.commit(mine)).kind === 'ERROR').toBe(true);
+  });
+
+  // #278: who may commit is checked before the limits, so another agent never gets a consent
+  // request for a proposal it could not commit even with the consent.
+  it('[M4b] a non-requester whose grant would need consent gets forbidden, not consent_required', async () => {
+    const svc = payService();
+    const each: P.Caveat[] = [
+      { each: { of: 'spend', max: 10, scale: 2, unit: 'USD' } },
+    ];
+    const mine = await intent(await client(svc, agent, principal), {
+      to: 'shop',
+      amt: 50,
+    });
+
+    // The same limit asks the requester for consent: the grant would need it.
+    const own = await (await client(svc, agent, principal, each)).commit(mine);
+
+    expect(own.kind === 'ERROR' && own.code).toBe('consent_required');
+
+    const thief = await client(svc, otherAgent, principal, each);
+    const r = await thief.commit(mine);
+
+    expect(r.kind === 'ERROR' && [r.code, r.message, r.consent]).toEqual([
+      'forbidden',
+      'only the agent that requested this proposal can commit it',
+      undefined,
+    ]);
   });
 
   it("[M5] conflict doesn't leak the hash; another principal can't read a receipt via replay", async () => {
@@ -3508,6 +3539,166 @@ describe('requests are read as Python reads them (#157)', () => {
     expect((await without.intent('v.do', {}, { auto: true })).kind).toBe(
       'PROPOSALS',
     );
+  });
+});
+
+// The cases above run through Service.handle. These call the verified request itself (#278), so
+// what it promises its handlers holds at its interface: the holder comes only from a proof it
+// verified, a COMMIT only from the proposal's requester, an owned handle only for its owner.
+describe('the verified request (#278)', () => {
+  const now = () => Math.floor(Date.now() / 1000);
+  const stateOf = (): Verifier => ({
+    id: 'v',
+    opts: { id: 'v', name: 'V', summary: 'v', trust: [principal.public] },
+    now,
+    used: new Map(),
+    asks: new Map(),
+    intents: new Map([
+      [
+        'v.do',
+        {
+          summary: 'do',
+          plan: () => ({ summary: 'do', effects: [], apply: () => null }),
+        },
+      ],
+    ]),
+    proposals: new Map(),
+    receipts: new Map(),
+    handles: new P.MemoryHandleStore(),
+  });
+  const proofBy = (seed: string, verb: P.Verb, target: string) =>
+    P.makeProof(seed, { aud: 'v', verb, target }, now());
+  const forged = () => ({
+    key: agent.public,
+    ts: now(),
+    sig: P.b64u(new Uint8Array(64)),
+  });
+  const codeOf = (p: Promise<unknown>) =>
+    p.then(
+      () => 'verified',
+      (e: unknown) => (e instanceof P.YeaError ? e.code : String(e)),
+    );
+
+  it('names the holder only from a proof it verified, and keys an auto replay by it (#157)', async () => {
+    const state = stateOf();
+    const grants = [await P.issueGrant({ principal, to: agent.public })];
+    const frame = {
+      yea: 1,
+      id: 'f1',
+      verb: 'INTENT',
+      capability: 'v.do',
+      auto: true,
+    };
+    const proof = await proofBy(agent.seed, 'INTENT', 'auto:v.do:f1');
+    const ok = await verifyRequest(state, { ...frame, grants, proof });
+
+    expect(
+      ok.verb === 'INTENT' && [ok.holder, ok.principal, ok.auto?.replay?.key],
+    ).toEqual([agent.public, principal.public, `${agent.public}:f1`]);
+    expect(
+      await codeOf(verifyRequest(state, { ...frame, grants, proof: forged() })),
+    ).toBe('unauthorized');
+    expect(
+      await codeOf(
+        verifyRequest(state, {
+          ...frame,
+          grants: new Array(1),
+          proof: forged(),
+        }),
+      ),
+    ).toBe('bad_frame');
+
+    // With no grants the forged proof is never read: anonymous, with no replay key.
+    const anon = await verifyRequest(state, {
+      ...frame,
+      grants: [],
+      proof: forged(),
+    });
+
+    expect(
+      anon.verb === 'INTENT' && [
+        anon.holder,
+        anon.principal,
+        anon.auto?.replay,
+      ],
+    ).toEqual([null, null, null]);
+  });
+
+  it('[M4] verifies a COMMIT only from the agent that requested the proposal', async () => {
+    const state = stateOf();
+    const plan = { summary: 'do', effects: [], apply: () => null };
+    const proposal = (id: string): P.Proposal => ({
+      id,
+      capability: 'v.do',
+      summary: 'do',
+      effects: [],
+      risk: 'low',
+      undo: null,
+      expires: now() + 600,
+      hash: `h_${id}`,
+    });
+    const created = now();
+
+    state.proposals.set('p_mine', {
+      proposal: proposal('p_mine'),
+      plan,
+      principal: principal.public,
+      requester: agent.public,
+      created,
+    });
+    state.proposals.set('p_anon', {
+      proposal: proposal('p_anon'),
+      plan,
+      principal: null,
+      requester: null,
+      created,
+    });
+
+    const commit = async (pid: string, who: { seed: string; public: string }) =>
+      verifyRequest(state, {
+        yea: 1,
+        id: 'c1',
+        verb: 'COMMIT',
+        proposal: pid,
+        hash: `h_${pid}`,
+        grants: [await P.issueGrant({ principal, to: who.public })],
+        proof: await proofBy(who.seed, 'COMMIT', `h_${pid}`),
+      });
+
+    const mine = await commit('p_mine', agent);
+
+    expect(mine.verb === 'COMMIT' && [mine.holder, mine.principal]).toEqual([
+      agent.public,
+      principal.public,
+    ]);
+    await expect(commit('p_mine', other)).rejects.toThrow(
+      'only the agent that requested this proposal',
+    );
+    await expect(commit('p_anon', agent)).rejects.toThrow('anonymous INTENT');
+  });
+
+  it('[L8] verifies an EXPAND of an owned handle only with the owner’s proof', async () => {
+    const state = stateOf();
+
+    state.handles.put('h_1', {
+      kind: 'text',
+      text: 'rest',
+      owner: agent.public,
+    });
+
+    const expand = async (seed: string) =>
+      verifyRequest(state, {
+        yea: 1,
+        id: 'e1',
+        verb: 'EXPAND',
+        handle: 'h_1',
+        proof: await proofBy(seed, 'EXPAND', 'h_1'),
+      });
+
+    const mine = await expand(agent.seed);
+
+    expect(mine.verb === 'EXPAND' && mine.owner).toBe(agent.public);
+    expect(await codeOf(expand(other.seed))).toBe('unauthorized');
   });
 });
 
