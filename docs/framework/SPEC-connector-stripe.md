@@ -91,8 +91,8 @@ wants a real API rather than a demo.
 - **Refused in v0, with a clear reason:** subscriptions with more than one item, and price
   changes that alter the billing interval (Stripe then resets the billing date and charges
   regardless).
-- **API version.** Every request sends `Stripe-Version: 2026-08-26.dahlia`, the version the
-  connector is tested against and the one `stripe` 22.6 pins. The connector passes it to the SDK
+- **API version.** Every request sends `Stripe-Version: 2026-09-30.endive`, the version the
+  connector is tested against and the one `stripe` 23.0 pins. The connector passes it to the SDK
   as `apiVersion`, typed as the SDK's `LatestApiVersion`, so an SDK update that moves to another
   version fails the build instead of changing what's sent. Subscription periods are read from
   `items.data[].current_period_end`, where Stripe has kept them since `2025-03-31.basil`.
@@ -476,6 +476,20 @@ After the switch to Stripe's SDK (#80):
   SDK's `stripe-node-retry-…`. The tests stub the SDK's retry delays (two undocumented
   methods) to 0, and fail if they're gone; its retry logic still runs. The example's test
   moved to `connectors/stripe/test/`, so `ts/` doesn't resolve `stripe`.
+
+After the move to `stripe` 23.0:
+
+- **Version.** `stripe` 23.0.0 pins `2026-09-30.endive`, so the pin moved with it. For the
+  objects the connector reads and the calls it makes (customers, charges, refunds,
+  subscriptions and their items, schedules, prices, the invoice preview), endive only adds
+  fields (`status_details`, `pause_schedules`, `current_trial`,
+  `pending_update.cancel_at_period_end`); nothing the connector uses was removed or retyped.
+  It hasn't been smoke-tested against Stripe on endive yet.
+- **Cut-off answers.** The SDK now throws `StripeConnectionError` for a response body that
+  stalls or is cut off, where it used to throw `StripeAPIError`. A write still reports "may have
+  happened". A read now says "no answer from Stripe … try again shortly" instead of
+  "Stripe: …".
+- **Node 18** is no longer supported by the SDK; the connector already needs Node 20.
 
 ## Decisions
 
